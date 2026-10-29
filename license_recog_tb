@@ -1,0 +1,138 @@
+`timescale 1ns/1ps
+// Simulation testbench for license_recog.v
+// Checks progress LEDs, parser acceptance ACK ('A'), and BOX response.
+// This is a simulation testbench; do NOT add it as a synthesis source.
+module license_recog_tb;
+    localparam integer CLKS_PER_BIT = 16;
+    localparam integer BIT_NS = CLKS_PER_BIT * 10;
+
+    reg CLK100MHZ = 1'b0;
+    reg uart_rxd = 1'b1;
+    reg [3:0] sw = 4'b0000;
+    reg [3:0] btn = 4'b0000;
+    wire uart_txd;
+    wire [3:0] led;
+
+    license_recog_led #(
+        .FRAME_W(8), .FRAME_H(4), .CLKS_PER_BIT(CLKS_PER_BIT),
+        .EDGE_THRESHOLD(8'd20), .MIN_EDGE_COUNT(2)
+    ) dut (
+        .CLK100MHZ(CLK100MHZ), .uart_rxd(uart_rxd), .uart_txd(uart_txd),
+        .sw(sw), .btn(btn), .led(led)
+    );
+
+    always #5 CLK100MHZ = ~CLK100MHZ;
+
+    task send_uart_byte(input [7:0] value);
+        integer k;
+        begin
+            uart_rxd = 1'b0;
+            #(BIT_NS);
+            for (k = 0; k < 8; k = k + 1) begin
+                uart_rxd = value[k];
+                #(BIT_NS);
+            end
+            uart_rxd = 1'b1;
+            #(BIT_NS);
+            #(BIT_NS/2);
+        end
+    endtask
+
+    task send_stage(input [7:0] stage);
+        begin
+            send_uart_byte(8'hC3);
+            send_uart_byte(8'h3C);
+            send_uart_byte(stage);
+            repeat (8) @(posedge CLK100MHZ);
+        end
+    endtask
+
+    task read_uart_byte(output [7:0] value);
+        integer k;
+        begin
+            // If the start bit has already begun, sample it; otherwise wait for it.
+            if (uart_txd !== 1'b0) @(negedge uart_txd);
+            #(BIT_NS + BIT_NS/2);
+            for (k = 0; k < 8; k = k + 1) begin
+                value[k] = uart_txd;
+                #(BIT_NS);
+            end
+            #(BIT_NS/2);
+        end
+    endtask
+
+    integer i;
+    reg [7:0] rx_byte;
+    reg [7:0] response [0:15];
+    reg [8*16-1:0] response_text;
+
+    initial begin
+        $display("=== Integrated license recognition + ACK testbench ===");
+        btn[0] = 1'b1;
+        repeat (5) @(posedge CLK100MHZ);
+        btn[0] = 1'b0;
+        repeat (10) @(posedge CLK100MHZ);
+
+        send_stage(8'd1);
+        if (led !== 4'b0001) $fatal(1, "FAIL: stage 1 expected 0001, got %b", led);
+        $display("PASS: stage 1 -> LED=%b", led);
+
+        send_stage(8'd2);
+        if (led !== 4'b0011) $fatal(1, "FAIL: stage 2 expected 0011, got %b", led);
+        $display("PASS: stage 2 -> LED=%b", led);
+
+        send_stage(8'd3);
+        if (led !== 4'b0111) $fatal(1, "FAIL: stage 3 expected 0111, got %b", led);
+        $display("PASS: stage 3 -> LED=%b", led);
+
+        // Send command C3 3C 10 followed by a strict 10-character candidate.
+        send_uart_byte(8'hC3);
+        send_uart_byte(8'h3C);
+        send_uart_byte(8'h10);
+        send_uart_byte("M"); send_uart_byte("H");
+        send_uart_byte("1"); send_uart_byte("2");
+        send_uart_byte("A"); send_uart_byte("B");
+        send_uart_byte("1"); send_uart_byte("2");
+        send_uart_byte("3"); send_uart_byte("4");
+        send_uart_byte(8'h0A);
+
+        // FPGA should return ASCII 'A' only after parser accepts the candidate.
+        read_uart_byte(rx_byte);
+        if (rx_byte !== 8'h41)
+            $fatal(1, "FAIL: expected FPGA ACK 'A' (0x41), received 0x%02X", rx_byte);
+        $display("PASS: FPGA parser ACK received: '%c' (0x%02X)", rx_byte, rx_byte);
+
+        repeat (10) @(posedge CLK100MHZ);
+        if (led !== 4'b1111) $fatal(1, "FAIL: accepted candidate should light all LEDs; got %b", led);
+        $display("PASS: valid candidate accepted -> LED=%b", led);
+
+        // Send tiny test frame: A5 5A + 32 grayscale pixels.
+        send_uart_byte(8'hA5);
+        send_uart_byte(8'h5A);
+        for (i = 0; i < 32; i = i + 1) begin
+            if ((i % 8) < 4) send_uart_byte(8'd20);
+            else send_uart_byte(8'd220);
+        end
+
+        for (i = 0; i < 16; i = i + 1) begin
+            read_uart_byte(rx_byte);
+            response[i] = rx_byte;
+        end
+        response_text = {response[0],response[1],response[2],response[3],
+                         response[4],response[5],response[6],response[7],
+                         response[8],response[9],response[10],response[11],
+                         response[12],response[13],response[14],response[15]};
+        $display("FPGA frame response: %s", response_text);
+        if (response[0] != "B" || response[1] != "O" || response[2] != "X" ||
+            response[3] != ":" || response[15] != 8'h0A)
+            $fatal(1, "FAIL: malformed BOX response from FPGA");
+        $display("PASS: frame receiver and BOX response format");
+        $display("=== ALL INTEGRATED TESTS PASSED ===");
+        $finish;
+    end
+
+    initial begin
+        #20_000_000;
+        $fatal(1, "TIMEOUT: testbench did not finish");
+    end
+endmodule
